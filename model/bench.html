@@ -1,0 +1,126 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Style transfer bench</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 16px; max-width: 900px; }
+  label { display: inline-block; margin: 0 12px 8px 0; }
+  canvas { max-width: 100%; display: block; margin: 12px 0; }
+  pre { background: #f4f4f4; padding: 8px; white-space: pre-wrap; word-break: break-all; }
+</style>
+
+<h1>Style transfer bench</h1>
+<p>Everything runs on this device. Leave the file inputs empty to use the sample images.</p>
+
+<label>Photo <input type="file" id="content" accept="image/*"></label>
+<label>Style <input type="file" id="style" accept="image/*"></label><br>
+<label>Backend <select id="backend"><option>webgpu<option>wasm</select></label>
+<label>Long side <select id="size"><option>512<option selected>1024<option>1536<option>2048</select></label>
+<label>Strength <input type="range" id="alpha" min="0" max="1" step="0.05" value="1"></label>
+<button id="run">Run</button>
+
+<canvas id="out"></canvas>
+<pre id="log"></pre>
+
+<script type="module">
+import * as ort from './ort/ort.webgpu.min.mjs';
+
+ort.env.wasm.wasmPaths = new URL('./ort/', location.href).href;
+
+const RUNS = 5;          // timed runs after the first one
+const STYLE_SIDE = 512;
+const $ = id => document.getElementById(id);
+const sessions = {};
+
+function log(tag, data) {
+  const line = `${tag} ${JSON.stringify(data)}`;
+  console.log(line);   // headless runs read results from the console
+  $('log').textContent += line + '\n';
+}
+
+async function toTensor(blob, longSide) {
+  const bmp = await createImageBitmap(blob);
+  const k = longSide / Math.max(bmp.width, bmp.height);
+  // The network halves the size twice, so both sides must be multiples of 4.
+  const w = Math.round(bmp.width * k / 4) * 4, h = Math.round(bmp.height * k / 4) * 4;
+  const ctx = new OffscreenCanvas(w, h).getContext('2d');
+  ctx.drawImage(bmp, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data, n = w * h, chw = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++)
+    for (let c = 0; c < 3; c++) chw[c * n + i] = px[4 * i + c] / 255;
+  return new ort.Tensor('float32', chw, [1, 3, h, w]);
+}
+
+function draw(tensor) {
+  const [, , h, w] = tensor.dims, n = h * w, img = new ImageData(w, h);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) img.data[4 * i + c] = tensor.data[c * n + i] * 255;
+    img.data[4 * i + 3] = 255;
+  }
+  $('out').width = w;
+  $('out').height = h;
+  $('out').getContext('2d').putImageData(img, 0, 0);
+}
+
+const pick = async (input, sample) => input.files[0] ?? (await fetch(sample)).blob();
+
+async function bench(backend, size) {
+  let loadMs = null;   // null when the session was already loaded
+  if (!sessions[backend]) {
+    const t = performance.now();
+    sessions[backend] = await ort.InferenceSession.create('./microast.onnx', { executionProviders: [backend] });
+    loadMs = Math.round(performance.now() - t);
+  }
+  const feeds = {
+    content: await toTensor(await pick($('content'), 'samples/content.jpg'), size),
+    style: await toTensor(await pick($('style'), 'samples/style.jpg'), STYLE_SIDE),
+    alpha: new ort.Tensor('float32', [+$('alpha').value], []),
+  };
+  const times = [];
+  let output;
+  for (let i = 0; i <= RUNS; i++) {
+    const t = performance.now();
+    ({ output } = await sessions[backend].run(feeds));
+    times.push(Math.round(performance.now() - t));
+  }
+  draw(output);
+  const rest = times.slice(1).sort((a, b) => a - b);
+  log('BENCH_RESULT', {
+    backend,
+    size: `${output.dims[3]}x${output.dims[2]}`,
+    loadMs,
+    firstMs: times[0],
+    medianMs: rest[rest.length >> 1],
+    wasm: performance.getEntriesByType('resource').filter(e => e.name.endsWith('.wasm'))
+      .map(e => `${e.name.split('/').pop()} ${(e.decodedBodySize / 1e6).toFixed(1)}MB`),
+  });
+}
+
+async function safe(backend, size) {
+  $('run').disabled = true;
+  try {
+    await bench(backend, size);
+  } catch (e) {
+    log('BENCH_ERROR', { backend, size, error: String(e) });
+  }
+  $('run').disabled = false;
+}
+
+const adapter = await navigator.gpu?.requestAdapter();
+log('BENCH_ENV', {
+  ua: navigator.userAgent,
+  gpu: adapter ? { vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.description } : null,
+  cores: navigator.hardwareConcurrency,
+  crossOriginIsolated,
+});
+
+$('run').onclick = () => safe($('backend').value, +$('size').value);
+
+// ?auto=webgpu,wasm&sizes=512,1024 runs every combination without clicks.
+const q = new URLSearchParams(location.search);
+if (q.has('auto')) {
+  for (const backend of q.get('auto').split(','))
+    for (const size of (q.get('sizes') ?? '512').split(',')) await safe(backend, +size);
+  log('BENCH_DONE', {});
+}
+</script>

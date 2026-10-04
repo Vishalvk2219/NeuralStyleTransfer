@@ -1,0 +1,5 @@
+# Downloaded model weights (hundreds of MB each). Sources are listed in CLAUDE.md.
+model/weights/
+# Raw model results, recomputed on demand by compare.py
+model/cache/
+__pycache__/
